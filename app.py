@@ -197,7 +197,7 @@ def save_file(file):
 
 @app.route("/")
 def home():
-    return "Flask App Deployed on Render!"
+    return "Eco-Commute Deployed on Render! "
 
 # Auth Routes
 @app.route('/api/auth/register', methods=['POST'])
