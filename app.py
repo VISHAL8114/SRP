@@ -16,6 +16,17 @@ import uuid
 from math import radians, cos, sin, sqrt, atan2
 import decimal
 from pytz import utc
+import cloudinary
+import cloudinary.uploader
+
+# Configure Cloudinary
+cloudinary.config(
+    cloud_name=os.getenv("CLOUDINARY_CLOUD_NAME", "dtrjgcv4s"),
+    api_key=os.getenv("CLOUDINARY_API_KEY", "984652638187289"),
+    api_secret=os.getenv("CLOUDINARY_API_SECRET", "P7MWAFCc_NGw10z4Jh_QPkP0gp8"),
+    secure=True
+)
+
 load_dotenv()
 
 app = Flask(__name__)
@@ -405,34 +416,39 @@ def update_password():
 @jwt_required()
 def upload_profile_picture():
     user_id = get_jwt_identity()
-    user = User.query.get(user_id)
-    
-    if not user:
-        return jsonify({'error': 'User not found'}), 404
-    
+
+    # Check if a file is provided
     if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
-    
+        return jsonify({"error": "No file provided"}), 400
+
     file = request.files['file']
-    filename = save_file(file)
-    
-    if not filename:
-        return jsonify({'error': 'Invalid file type'}), 400
-    
-    # Delete old profile picture if exists
-    if user.profile_picture:
-        try:
-            os.remove(os.path.join(app.config['UPLOAD_FOLDER'], user.profile_picture))
-        except:
-            pass
-    
-    user.profile_picture = filename
-    db.session.commit()
-    
-    return jsonify({
-        'message': 'Profile picture uploaded successfully',
-        'profile_picture': f"{request.host_url}uploads/{filename}"  # Include full URL
-    })
+
+    try:
+        # Upload the file to Cloudinary
+        result = cloudinary.uploader.upload(
+            file,
+            folder="profile_pictures",  # Store images in a specific folder
+            public_id=f"user_{user_id}",  # Use a unique identifier for the user
+            overwrite=True,  # Overwrite the existing image for the user
+            resource_type="image"
+        )
+
+        # Get the secure URL of the uploaded image
+        profile_picture_url = result['secure_url']
+
+        # Update the user's profile picture in the database
+        user = User.query.get(user_id)
+        if user:
+            user.profile_picture = profile_picture_url
+            db.session.commit()
+
+        return jsonify({
+            "message": "Profile picture uploaded successfully",
+            "profile_picture": profile_picture_url
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to upload profile picture: {str(e)}"}), 500
 
 @app.route('/uploads/<filename>', methods=['GET'])
 def serve_file(filename):
@@ -1366,4 +1382,4 @@ def track_ride(ride_id):
     })
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000))) 
