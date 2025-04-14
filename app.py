@@ -629,18 +629,21 @@ def search_rides():
     data = request.get_json()
 
     # Validate required fields
-    if 'latitude' not in data or 'longitude' not in data:
-        return jsonify({'error': 'User location (latitude and longitude) is required'}), 400
+    required_fields = ['from', 'to']
+    if not all(field in data for field in required_fields):
+        return jsonify({'error': 'From and To locations are required'}), 400
 
-    user_lat = data['latitude']
-    user_lng = data['longitude']
-    ride_type = data.get('type')  # Optional
+    from_lat = data['from']['latitude']
+    from_lng = data['from']['longitude']
+    to_lat = data['to']['latitude']
+    to_lng = data['to']['longitude']
+
+    # Optional filters
     departure_time = data.get('departure_time')  # Optional
 
     # Basic query
     query = OfferedRide.query.filter(
         OfferedRide.status == 'pending',
-        OfferedRide.departure_time >= datetime.now(utc),  # Use pytz for UTC
         OfferedRide.available_seats > 0
     )
 
@@ -652,13 +655,22 @@ def search_rides():
         except ValueError:
             return jsonify({'error': 'Invalid departure time format'}), 400
 
-    # Fetch all rides and filter by distance
+    # Fetch all rides and filter by route and distance
     rides = query.all()
-    nearby_rides = []
+    matching_rides = []
     for ride in rides:
-        distance = calculate_distance(user_lat, user_lng, ride.pickup_latitude, ride.pickup_longitude)
-        if distance <= 5:  # Filter rides within 5km
-            nearby_rides.append({
+        # Calculate distance between user's "from" location and ride's pickup location
+        pickup_distance = calculate_distance(from_lat, from_lng, ride.pickup_latitude, ride.pickup_longitude)
+
+        # Calculate distance between user's "to" location and ride's dropoff location
+        dropoff_distance = calculate_distance(to_lat, to_lng, ride.dropoff_latitude, ride.dropoff_longitude)
+
+        # Check if both pickup and dropoff locations are within 5 km
+        if pickup_distance <= 5 and dropoff_distance <= 5:
+            # Calculate distance from user's current location to the ride's pickup location
+            user_distance = calculate_distance(from_lat, from_lng, ride.pickup_latitude, ride.pickup_longitude)
+
+            matching_rides.append({
                 'id': ride.id,
                 'driver': {
                     'id': ride.driver.id,
@@ -679,15 +691,15 @@ def search_rides():
                 'departure_time': ride.departure_time.isoformat(),
                 'available_seats': ride.available_seats,
                 'price_per_seat': float(ride.price_per_seat),
-                'distance': distance,
+                'distance_from_user': user_distance,
                 'duration': ride.duration,
                 'created_at': ride.created_at.isoformat()
             })
 
-    # Sort by distance
-    nearby_rides.sort(key=lambda x: x['distance'])
+    # Sort by distance from user's current location
+    matching_rides.sort(key=lambda x: x['distance_from_user'])
 
-    return jsonify(nearby_rides)
+    return jsonify(matching_rides)
 
 @app.route('/api/rides', methods=['POST'])
 @jwt_required()
