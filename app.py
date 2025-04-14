@@ -13,6 +13,9 @@ import os
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 import uuid
+from math import radians, cos, sin, sqrt, atan2
+import decimal
+from pytz import utc
 load_dotenv()
 
 app = Flask(__name__)
@@ -26,6 +29,7 @@ db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 bcrypt = Bcrypt(app)
 jwt = JWTManager(app)
+
 # User Model
 class User(db.Model):
     __tablename__ = 'users'
@@ -104,6 +108,41 @@ class Ride(db.Model):
     bookings = db.relationship('Booking', backref='ride', lazy=True)
     messages = db.relationship('Message', backref='ride', lazy=True)
 
+class OfferedRide(db.Model):
+    __tablename__ = 'offered_rides'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    driver_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    vehicle_id = db.Column(db.Integer, db.ForeignKey('vehicles.id'))
+    pickup_address = db.Column(db.Text, nullable=False)
+    pickup_latitude = db.Column(db.Numeric(10, 8), nullable=False)
+    pickup_longitude = db.Column(db.Numeric(11, 8), nullable=False)
+    dropoff_address = db.Column(db.Text, nullable=False)
+    dropoff_latitude = db.Column(db.Numeric(10, 8), nullable=False)
+    dropoff_longitude = db.Column(db.Numeric(11, 8), nullable=False)
+    departure_time = db.Column(db.DateTime, nullable=False)
+    available_seats = db.Column(db.Integer, nullable=False)
+    price_per_seat = db.Column(db.Numeric(10, 2), nullable=False)
+    status = db.Column(db.String(20), default='pending')  # 'pending', 'active', 'completed', 'cancelled'
+    distance = db.Column(db.Numeric(10, 2))  # in km
+    duration = db.Column(db.Integer)  # in minutes
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    # Relationships
+    bookings = db.relationship('BookedRide', backref='offered_ride', lazy=True)
+    driver = db.relationship('User', backref='offered_rides', lazy=True)
+    vehicle = db.relationship('Vehicle', backref='offered_rides', lazy=True)  # Add this relationship
+
+class BookedRide(db.Model):
+    __tablename__ = 'booked_rides'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    ride_id = db.Column(db.Integer, db.ForeignKey('offered_rides.id'), nullable=False)
+    passenger_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    seats_booked = db.Column(db.Integer, nullable=False)
+    total_price = db.Column(db.Numeric(10, 2), nullable=False)
+    booking_status = db.Column(db.String(20), default='confirmed')  # 'confirmed', 'cancelled'
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Booking(db.Model):
     __tablename__ = 'bookings'  # Corrected tablename syntax
@@ -197,6 +236,20 @@ def save_file(file):
         return unique_filename
     return None
 
+def calculate_distance(lat1, lon1, lat2, lon2):
+    # Convert decimal.Decimal to float if necessary
+    if isinstance(lat2, decimal.Decimal):
+        lat2 = float(lat2)
+    if isinstance(lon2, decimal.Decimal):
+        lon2 = float(lon2)
+
+    # Haversine formula to calculate distance in kilometers
+    R = 6371  # Radius of the Earth in km
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
 
 @app.route("/")
 def home():
@@ -478,135 +531,156 @@ def delete_saved_address(address_id):
     return jsonify({'message': 'Address deleted successfully'})
 
 # Ride Routes
-@app.route('/api/rides/search', methods=['GET'])
+@app.route('/api/rides/search', methods=['POST'])
 @jwt_required()
 def search_rides():
-    # Get query parameters
-    pickup_lat = request.args.get('pickup_lat', type=float)
-    pickup_lng = request.args.get('pickup_lng', type=float)
-    dropoff_lat = request.args.get('dropoff_lat', type=float)
-    dropoff_lng = request.args.get('dropoff_lng', type=float)
-    ride_type = request.args.get('type')
-    departure_time = request.args.get('departure_time')
-    
-    if not all([pickup_lat, pickup_lng, dropoff_lat, dropoff_lng]):
-        return jsonify({'error': 'Pickup and dropoff coordinates are required'}), 400
-    
+    user_id = get_jwt_identity()
+    data = request.get_json()
+
+    # Validate required fields
+    if 'latitude' not in data or 'longitude' not in data:
+        return jsonify({'error': 'User location (latitude and longitude) is required'}), 400
+
+    user_lat = data['latitude']
+    user_lng = data['longitude']
+    ride_type = data.get('type')  # Optional
+    departure_time = data.get('departure_time')  # Optional
+
     # Basic query
-    query = Ride.query.filter(
-        Ride.status == 'pending',
-        Ride.departure_time >= datetime.utcnow(),
-        Ride.available_seats > 0
+    query = OfferedRide.query.filter(
+        OfferedRide.status == 'pending',
+        OfferedRide.departure_time >= datetime.now(utc),  # Use pytz for UTC
+        OfferedRide.available_seats > 0
     )
-    
+
     # Filter by ride type if provided
     if ride_type:
         query = query.join(Vehicle).filter(Vehicle.type == ride_type)
-    
+
     # Filter by departure time if provided
     if departure_time:
         try:
             departure_datetime = datetime.fromisoformat(departure_time)
-            query = query.filter(Ride.departure_time >= departure_datetime)
-        except:
+            query = query.filter(OfferedRide.departure_time >= departure_datetime)
+        except ValueError:
             return jsonify({'error': 'Invalid departure time format'}), 400
-    
-    # TODO: Add distance-based filtering (using PostGIS or simple distance calculation)
-    
-    rides = query.order_by(Ride.departure_time.asc()).all()
-    
-    return jsonify([{
-        'id': ride.id,
-        'driver': {
-            'id': ride.driver.id,
-            'name': ride.driver.name,
-            'profile_picture': ride.driver.profile_picture,
-            'rating': float(ride.driver.rating) if ride.driver.rating else None
-        },
-        'vehicle': {
-            'id': ride.vehicle.id,
-            'model': ride.vehicle.model,
-            'number': ride.vehicle.number,
-            'type': ride.vehicle.type,
-            'capacity': ride.vehicle.capacity
-        } if ride.vehicle else None,
-        'pickup_address': ride.pickup_address,
-        'pickup_latitude': float(ride.pickup_latitude),
-        'pickup_longitude': float(ride.pickup_longitude),
-        'dropoff_address': ride.dropoff_address,
-        'dropoff_latitude': float(ride.dropoff_latitude),
-        'dropoff_longitude': float(ride.dropoff_longitude),
-        'departure_time': ride.departure_time.isoformat(),
-        'available_seats': ride.available_seats,
-        'price_per_seat': float(ride.price_per_seat),
-        'distance': float(ride.distance) if ride.distance else None,
-        'duration': ride.duration,
-        'created_at': ride.created_at.isoformat()
-    } for ride in rides])
+
+    # Fetch all rides and filter by distance
+    rides = query.all()
+    nearby_rides = []
+    for ride in rides:
+        distance = calculate_distance(user_lat, user_lng, ride.pickup_latitude, ride.pickup_longitude)
+        if distance <= 5:  # Filter rides within 5km
+            nearby_rides.append({
+                'id': ride.id,
+                'driver': {
+                    'id': ride.driver.id,
+                    'name': ride.driver.name,
+                    'profile_picture': ride.driver.profile_picture,
+                    'rating': float(ride.driver.rating) if ride.driver.rating else None
+                },
+                'vehicle': {
+                    'id': ride.vehicle.id,
+                    'model': ride.vehicle.model,
+                    'number': ride.vehicle.number,
+                    'type': ride.vehicle.type,
+                    'capacity': ride.vehicle.capacity
+                } if ride.vehicle else None,
+                'pickup_address': ride.pickup_address,
+                'pickup_latitude': float(ride.pickup_latitude),
+                'pickup_longitude': float(ride.pickup_longitude),
+                'dropoff_address': ride.dropoff_address,
+                'dropoff_latitude': float(ride.dropoff_latitude),
+                'dropoff_longitude': float(ride.dropoff_longitude),
+                'departure_time': ride.departure_time.isoformat(),
+                'available_seats': ride.available_seats,
+                'price_per_seat': float(ride.price_per_seat),
+                'distance': distance,
+                'duration': ride.duration,
+                'created_at': ride.created_at.isoformat()
+            })
+
+    # Sort by distance
+    nearby_rides.sort(key=lambda x: x['distance'])
+
+    return jsonify(nearby_rides)
 
 @app.route('/api/rides', methods=['POST'])
 @jwt_required()
 def create_ride():
-    user_id = get_jwt_identity()
-    user = User.query.get(user_id)
-    
-    if not user.is_driver:
-        return jsonify({'error': 'Only drivers can offer rides'}), 403
-    
-    data = request.get_json()
-    
-    required_fields = [
-        'vehicle_id', 'pickup_address', 'pickup_latitude', 'pickup_longitude',
-        'dropoff_address', 'dropoff_latitude', 'dropoff_longitude',
-        'departure_time', 'available_seats', 'price_per_seat'
-    ]
-    
-    if not all(field in data for field in required_fields):
-        return jsonify({'error': 'Missing required fields'}), 400
-    
-    # Check if vehicle belongs to user
-    vehicle = Vehicle.query.filter_by(id=data['vehicle_id'], user_id=user_id).first()
-    if not vehicle:
-        return jsonify({'error': 'Vehicle not found or does not belong to you'}), 404
-    
-    # Parse departure time
     try:
-        departure_time = datetime.fromisoformat(data['departure_time'])
-    except:
-        return jsonify({'error': 'Invalid departure time format'}), 400
+        user_id = get_jwt_identity()
+        user = User.query.get(user_id)
+        
+        if not user.is_driver:
+            return jsonify({'error': 'Only drivers can offer rides'}), 403
+        
+        data = request.get_json()
+        
+        # Validate required fields
+        required_fields = [
+            'from', 'to', 'date', 'time', 'vehicleModel', 'vehicleNumber',
+            'availableSeats', 'pricePerSeat', 'distanceInKm', 'estimatedTravelTime'
+        ]
+        if not all(field in data for field in required_fields):
+            return jsonify({'error': 'Missing required fields'}), 400
+        
+        # Parse departure time
+        try:
+            departure_time = datetime.strptime(f"{data['date']} {data['time']}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            return jsonify({'error': 'Invalid date or time format'}), 400
+        
+        # Create or find vehicle
+        vehicle = Vehicle.query.filter_by(user_id=user_id, number=data['vehicleNumber']).first()
+        if not vehicle:
+            vehicle = Vehicle(
+                user_id=user_id,
+                model=data['vehicleModel'],
+                number=data['vehicleNumber'],
+                type='car',  # Assuming car for now
+                capacity=data['availableSeats']
+            )
+            db.session.add(vehicle)
+            db.session.commit()
+        
+        # Create offered ride
+        offered_ride = OfferedRide(
+            driver_id=user_id,
+            vehicle_id=vehicle.id,
+            pickup_address=data['from']['location'],
+            pickup_latitude=data['from']['latitude'],
+            pickup_longitude=data['from']['longitude'],
+            dropoff_address=data['to']['location'],
+            dropoff_latitude=data['to']['latitude'],
+            dropoff_longitude=data['to']['longitude'],
+            departure_time=departure_time,
+            available_seats=data['availableSeats'],
+            price_per_seat=data['pricePerSeat'],
+            distance=data['distanceInKm'],
+            duration=int(data['estimatedTravelTime'].split(':')[0]) * 60 + int(data['estimatedTravelTime'].split(':')[1])
+        )
+        
+        db.session.add(offered_ride)
+        db.session.commit()
+        
+        return jsonify({
+            'message': 'Ride created successfully',
+            'ride': {
+                'id': offered_ride.id,
+                'pickup_address': offered_ride.pickup_address,
+                'dropoff_address': offered_ride.dropoff_address,
+                'departure_time': offered_ride.departure_time.isoformat(),
+                'available_seats': offered_ride.available_seats,
+                'price_per_seat': float(offered_ride.price_per_seat),
+                'status': offered_ride.status
+            }
+        }), 201
     
-    # Create ride
-    ride = Ride(
-        driver_id=user_id,
-        vehicle_id=data['vehicle_id'],
-        pickup_address=data['pickup_address'],
-        pickup_latitude=data['pickup_latitude'],
-        pickup_longitude=data['pickup_longitude'],
-        dropoff_address=data['dropoff_address'],
-        dropoff_latitude=data['dropoff_latitude'],
-        dropoff_longitude=data['dropoff_longitude'],
-        departure_time=departure_time,
-        available_seats=data['available_seats'],
-        price_per_seat=data['price_per_seat'],
-        distance=data.get('distance'),
-        duration=data.get('duration')
-    )
-    
-    db.session.add(ride)
-    db.session.commit()
-    
-    return jsonify({
-        'message': 'Ride created successfully',
-        'ride': {
-            'id': ride.id,
-            'pickup_address': ride.pickup_address,
-            'dropoff_address': ride.dropoff_address,
-            'departure_time': ride.departure_time.isoformat(),
-            'available_seats': ride.available_seats,
-            'price_per_seat': float(ride.price_per_seat),
-            'status': ride.status
-        }
-    }), 201
+    except Exception as e:
+        # Log the error for debugging
+        app.logger.error(f"Error creating ride: {e}")
+        return jsonify({'error': 'An internal server error occurred'}), 500
 
 @app.route('/api/rides/<int:ride_id>', methods=['GET'])
 @jwt_required()
