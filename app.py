@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_migrate import Migrate
 from flask_bcrypt import Bcrypt
+from flask import send_from_directory
 from flask_jwt_extended import (
     JWTManager, jwt_required, create_access_token,
     get_jwt_identity
@@ -19,6 +20,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://neondb_owner:npg_K2El5pFwZ
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['JWT_SECRET_KEY'] = os.getenv('JWT_SECRET', 'super-secret-key')
 app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = timedelta(hours=24)  # Token lasts for 24 hours
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
@@ -65,15 +67,16 @@ class Vehicle(db.Model):
 
     # Relationships
     rides = db.relationship('Ride', backref='vehicle', lazy=True)
+
 class SavedAddress(db.Model):
-    _tablename_ = 'saved_addresses'
+    __tablename__ = 'saved_addresses'  # Corrected tablename syntax
     
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     name = db.Column(db.String(50), nullable=False)
     address = db.Column(db.Text, nullable=False)
-    latitude = db.Column(db.Numeric(10,8))
-    longitude = db.Column(db.Numeric(11,8))
+    latitude = db.Column(db.Numeric(10, 8))
+    longitude = db.Column(db.Numeric(11, 8))
     icon = db.Column(db.String(20))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -231,7 +234,7 @@ def register():
     db.session.commit()
     
     # Generate JWT token
-    access_token = create_access_token(identity=user.id)
+    access_token = create_access_token(identity=str(user.id))  # Convert user.id to string
     
     return jsonify({
         'message': 'User registered successfully',
@@ -260,7 +263,7 @@ def login():
         return jsonify({'error': 'Invalid email or password'}), 401
     
     # Generate JWT token
-    access_token = create_access_token(identity=user.id)
+    access_token = create_access_token(identity=str(user.id))  # Convert user.id to string
     
     return jsonify({
         'message': 'Login successful',
@@ -375,9 +378,12 @@ def upload_profile_picture():
     
     return jsonify({
         'message': 'Profile picture uploaded successfully',
-        'profile_picture': filename
+        'profile_picture': f"{request.host_url}uploads/{filename}"  # Include full URL
     })
 
+@app.route('/uploads/<filename>', methods=['GET'])
+def serve_file(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 # Similar endpoints for PAN card and driving license uploads would follow the same pattern
 
 # Saved Addresses Routes
