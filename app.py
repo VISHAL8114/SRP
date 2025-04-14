@@ -121,10 +121,9 @@ class Ride(db.Model):
 
 class OfferedRide(db.Model):
     __tablename__ = 'offered_rides'
-    
+
     id = db.Column(db.Integer, primary_key=True)
     driver_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    vehicle_id = db.Column(db.Integer, db.ForeignKey('vehicles.id'))
     pickup_address = db.Column(db.Text, nullable=False)
     pickup_latitude = db.Column(db.Numeric(10, 8), nullable=False)
     pickup_longitude = db.Column(db.Numeric(11, 8), nullable=False)
@@ -134,15 +133,15 @@ class OfferedRide(db.Model):
     departure_time = db.Column(db.DateTime, nullable=False)
     available_seats = db.Column(db.Integer, nullable=False)
     price_per_seat = db.Column(db.Numeric(10, 2), nullable=False)
-    status = db.Column(db.String(20), default='pending')  # 'pending', 'active', 'completed', 'cancelled'
-    distance = db.Column(db.Numeric(10, 2))  # in km
-    duration = db.Column(db.Integer)  # in minutes
+    vehicle_model = db.Column(db.String(50), nullable=False)  # Vehicle model
+    vehicle_number = db.Column(db.String(20), nullable=False)  # Vehicle number
+    status = db.Column(db.String(20), default='pending')
+    distance = db.Column(db.Numeric(10, 2))
+    duration = db.Column(db.Integer)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     # Relationships
-    bookings = db.relationship('BookedRide', backref='offered_ride', lazy=True)
     driver = db.relationship('User', backref='offered_rides', lazy=True)
-    vehicle = db.relationship('Vehicle', backref='offered_rides', lazy=True)  # Add this relationship
 
 class BookedRide(db.Model):
     __tablename__ = 'booked_rides'
@@ -450,6 +449,82 @@ def upload_profile_picture():
     except Exception as e:
         return jsonify({"error": f"Failed to upload profile picture: {str(e)}"}), 500
 
+@app.route('/api/users/me/pan-card', methods=['POST'])
+@jwt_required()
+def upload_pan_card():
+    user_id = get_jwt_identity()
+
+    # Check if a file is provided
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files['file']
+
+    try:
+        # Upload the file to Cloudinary
+        result = cloudinary.uploader.upload(
+            file,
+            folder="pan_cards",  # Store images in a specific folder
+            public_id=f"user_{user_id}_pan_card",  # Use a unique identifier for the user
+            overwrite=True,  # Overwrite the existing image for the user
+            resource_type="image"
+        )
+
+        # Get the secure URL of the uploaded image
+        pan_card_url = result['secure_url']
+
+        # Update the user's PAN card in the database
+        user = User.query.get(user_id)
+        if user:
+            user.pan_card = pan_card_url
+            db.session.commit()
+
+        return jsonify({
+            "message": "PAN card uploaded successfully",
+            "pan_card": pan_card_url
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to upload PAN card: {str(e)}"}), 500
+
+@app.route('/api/users/me/driving-license', methods=['POST'])
+@jwt_required()
+def upload_driving_license():
+    user_id = get_jwt_identity()
+
+    # Check if a file is provided
+    if 'file' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    file = request.files['file']
+
+    try:
+        # Upload the file to Cloudinary
+        result = cloudinary.uploader.upload(
+            file,
+            folder="driving_licenses",  # Store images in a specific folder
+            public_id=f"user_{user_id}_driving_license",  # Use a unique identifier for the user
+            overwrite=True,  # Overwrite the existing image for the user
+            resource_type="image"
+        )
+
+        # Get the secure URL of the uploaded image
+        driving_license_url = result['secure_url']
+
+        # Update the user's driving license in the database
+        user = User.query.get(user_id)
+        if user:
+            user.driving_license = driving_license_url
+            db.session.commit()
+
+        return jsonify({
+            "message": "Driving license uploaded successfully",
+            "driving_license": driving_license_url
+        }), 200
+
+    except Exception as e:
+        return jsonify({"error": f"Failed to upload driving license: {str(e)}"}), 500
+
 @app.route('/uploads/<filename>', methods=['GET'])
 def serve_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
@@ -569,10 +644,6 @@ def search_rides():
         OfferedRide.available_seats > 0
     )
 
-    # Filter by ride type if provided
-    if ride_type:
-        query = query.join(Vehicle).filter(Vehicle.type == ride_type)
-
     # Filter by departure time if provided
     if departure_time:
         try:
@@ -596,12 +667,9 @@ def search_rides():
                     'rating': float(ride.driver.rating) if ride.driver.rating else None
                 },
                 'vehicle': {
-                    'id': ride.vehicle.id,
-                    'model': ride.vehicle.model,
-                    'number': ride.vehicle.number,
-                    'type': ride.vehicle.type,
-                    'capacity': ride.vehicle.capacity
-                } if ride.vehicle else None,
+                    'model': ride.vehicle_model,
+                    'number': ride.vehicle_number
+                },
                 'pickup_address': ride.pickup_address,
                 'pickup_latitude': float(ride.pickup_latitude),
                 'pickup_longitude': float(ride.pickup_longitude),
@@ -626,13 +694,13 @@ def search_rides():
 def create_ride():
     try:
         user_id = get_jwt_identity()
-        user = User.query.get(user_id)
-        
+        user = db.session.get(User, user_id)
+
         if not user.is_driver:
             return jsonify({'error': 'Only drivers can offer rides'}), 403
-        
+
         data = request.get_json()
-        
+
         # Validate required fields
         required_fields = [
             'from', 'to', 'date', 'time', 'vehicleModel', 'vehicleNumber',
@@ -640,30 +708,16 @@ def create_ride():
         ]
         if not all(field in data for field in required_fields):
             return jsonify({'error': 'Missing required fields'}), 400
-        
+
         # Parse departure time
         try:
             departure_time = datetime.strptime(f"{data['date']} {data['time']}", "%Y-%m-%d %H:%M")
         except ValueError:
             return jsonify({'error': 'Invalid date or time format'}), 400
-        
-        # Create or find vehicle
-        vehicle = Vehicle.query.filter_by(user_id=user_id, number=data['vehicleNumber']).first()
-        if not vehicle:
-            vehicle = Vehicle(
-                user_id=user_id,
-                model=data['vehicleModel'],
-                number=data['vehicleNumber'],
-                type='car',  # Assuming car for now
-                capacity=data['availableSeats']
-            )
-            db.session.add(vehicle)
-            db.session.commit()
-        
-        # Create offered ride
-        offered_ride = OfferedRide(
+
+        # Create the ride
+        ride = OfferedRide(
             driver_id=user_id,
-            vehicle_id=vehicle.id,
             pickup_address=data['from']['location'],
             pickup_latitude=data['from']['latitude'],
             pickup_longitude=data['from']['longitude'],
@@ -673,28 +727,31 @@ def create_ride():
             departure_time=departure_time,
             available_seats=data['availableSeats'],
             price_per_seat=data['pricePerSeat'],
+            vehicle_model=data['vehicleModel'],
+            vehicle_number=data['vehicleNumber'],
             distance=data['distanceInKm'],
             duration=int(data['estimatedTravelTime'].split(':')[0]) * 60 + int(data['estimatedTravelTime'].split(':')[1])
         )
-        
-        db.session.add(offered_ride)
+
+        db.session.add(ride)
         db.session.commit()
-        
+
         return jsonify({
             'message': 'Ride created successfully',
             'ride': {
-                'id': offered_ride.id,
-                'pickup_address': offered_ride.pickup_address,
-                'dropoff_address': offered_ride.dropoff_address,
-                'departure_time': offered_ride.departure_time.isoformat(),
-                'available_seats': offered_ride.available_seats,
-                'price_per_seat': float(offered_ride.price_per_seat),
-                'status': offered_ride.status
+                'id': ride.id,
+                'pickup_address': ride.pickup_address,
+                'dropoff_address': ride.dropoff_address,
+                'departure_time': ride.departure_time.isoformat(),
+                'available_seats': ride.available_seats,
+                'price_per_seat': float(ride.price_per_seat),
+                'vehicle_model': ride.vehicle_model,
+                'vehicle_number': ride.vehicle_number,
+                'status': ride.status
             }
         }), 201
-    
+
     except Exception as e:
-        # Log the error for debugging
         app.logger.error(f"Error creating ride: {e}")
         return jsonify({'error': 'An internal server error occurred'}), 500
 
@@ -1382,4 +1439,4 @@ def track_ride(ride_id):
     })
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000))) 
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
