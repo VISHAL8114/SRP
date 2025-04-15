@@ -154,6 +154,9 @@ class BookedRide(db.Model):
     booking_status = db.Column(db.String(20), default='confirmed')  # 'confirmed', 'cancelled'
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
+    # Relationships
+    ride = db.relationship('OfferedRide', backref='bookings', lazy=True)
+
 class Booking(db.Model):
     __tablename__ = 'bookings'  # Corrected tablename syntax
     
@@ -183,8 +186,8 @@ class Message(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 class Notification(db.Model):
-    _tablename_ = 'notifications'
-    
+    __tablename__ = 'notifications'
+
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     type = db.Column(db.String(20), nullable=False)  # 'ride', 'message', 'promo'
@@ -525,6 +528,43 @@ def upload_driving_license():
     except Exception as e:
         return jsonify({"error": f"Failed to upload driving license: {str(e)}"}), 500
 
+@app.route('/api/users/me/booked-rides', methods=['GET'])
+@jwt_required()
+def get_booked_rides():
+    user_id = get_jwt_identity()
+    bookings = BookedRide.query.filter_by(passenger_id=user_id).all()
+
+    return jsonify([{
+        'id': booking.id,
+        'ride_id': booking.ride_id,
+        'pickup_address': booking.ride.pickup_address,
+        'dropoff_address': booking.ride.dropoff_address,
+        'departure_time': booking.ride.departure_time.isoformat(),
+        'seats_booked': booking.seats_booked,
+        'total_price': float(booking.total_price),
+        'status': booking.booking_status,
+        'created_at': booking.created_at.isoformat()
+    } for booking in bookings])
+
+@app.route('/api/users/me/offered-rides', methods=['GET'])
+@jwt_required()
+def get_offered_rides():
+    user_id = get_jwt_identity()
+    rides = OfferedRide.query.filter_by(driver_id=user_id).all()
+
+    return jsonify([{
+        'id': ride.id,
+        'pickup_address': ride.pickup_address,
+        'dropoff_address': ride.dropoff_address,
+        'departure_time': ride.departure_time.isoformat(),
+        'available_seats': ride.available_seats,
+        'price_per_seat': float(ride.price_per_seat),
+        'vehicle_model': ride.vehicle_model,
+        'vehicle_number': ride.vehicle_number,
+        'status': ride.status,
+        'created_at': ride.created_at.isoformat()
+    } for ride in rides])
+
 @app.route('/uploads/<filename>', methods=['GET'])
 def serve_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
@@ -638,22 +678,17 @@ def search_rides():
     to_lat = data['to']['latitude']
     to_lng = data['to']['longitude']
 
-    # Optional filters
-    departure_time = data.get('departure_time')  # Optional
+    # Get current time and calculate one hour from now
+    current_time = datetime.utcnow()
+    one_hour_from_now = current_time + timedelta(hours=1)
 
     # Basic query
     query = OfferedRide.query.filter(
         OfferedRide.status == 'pending',
-        OfferedRide.available_seats > 0
+        OfferedRide.available_seats > 0,
+        OfferedRide.departure_time >= current_time,  # Exclude rides with past departure times
+        OfferedRide.departure_time >= one_hour_from_now  # Exclude rides departing within the next hour
     )
-
-    # Filter by departure time if provided
-    if departure_time:
-        try:
-            departure_datetime = datetime.fromisoformat(departure_time)
-            query = query.filter(OfferedRide.departure_time >= departure_datetime)
-        except ValueError:
-            return jsonify({'error': 'Invalid departure time format'}), 400
 
     # Fetch all rides and filter by route and distance
     rides = query.all()
@@ -767,6 +802,68 @@ def create_ride():
         app.logger.error(f"Error creating ride: {e}")
         return jsonify({'error': 'An internal server error occurred'}), 500
 
+@app.route('/api/rides/<int:ride_id>/book', methods=['POST'])
+@jwt_required()
+def book_ride(ride_id):
+    user_id = get_jwt_identity()
+    data = request.get_json()
+
+    # Validate required fields
+    if 'seats' not in data:
+        return jsonify({'error': 'Number of seats is required'}), 400
+
+    ride = OfferedRide.query.get(ride_id)
+
+    if not ride:
+        return jsonify({'error': 'Ride not found'}), 404
+
+    if ride.driver_id == user_id:
+        return jsonify({'error': 'You cannot book your own ride'}), 400
+
+    if ride.available_seats < data['seats']:
+        return jsonify({'error': 'Not enough seats available'}), 400
+
+    # Calculate total price
+    total_price = ride.price_per_seat * data['seats']
+
+    # Create booking
+    booking = BookedRide(
+        ride_id=ride_id,
+        passenger_id=user_id,
+        seats_booked=data['seats'],
+        total_price=total_price
+    )
+
+    # Update available seats
+    ride.available_seats -= data['seats']
+
+    db.session.add(booking)
+    db.session.commit()
+
+    # Notify the ride giver
+    notification = Notification(
+        user_id=ride.driver_id,
+        type='ride',
+        title='New Booking',
+        message=f'{booking.seats_booked} seat(s) have been booked by a user.',
+        reference_id=ride.id
+    )
+
+    db.session.add(notification)
+    db.session.commit()
+
+    return jsonify({
+        'message': 'Ride booked successfully',
+        'booking': {
+            'id': booking.id,
+            'ride_id': booking.ride_id,
+            'seats_booked': booking.seats_booked,
+            'total_price': float(booking.total_price),
+            'status': booking.booking_status,
+            'created_at': booking.created_at.isoformat()
+        }
+    }), 201
+
 @app.route('/api/rides/<int:ride_id>', methods=['GET'])
 @jwt_required()
 def get_ride(ride_id):
@@ -809,23 +906,61 @@ def get_ride(ride_id):
 @jwt_required()
 def cancel_ride(ride_id):
     user_id = get_jwt_identity()
-    ride = Ride.query.get(ride_id)
-    
+    ride = db.session.get(OfferedRide, ride_id)
+
     if not ride:
         return jsonify({'error': 'Ride not found'}), 404
-    
-    if ride.driver_id != user_id:
-        return jsonify({'error': 'You can only cancel your own rides'}), 403
-    
-    if ride.status != 'pending':
-        return jsonify({'error': 'Only pending rides can be cancelled'}), 400
-    
-    ride.status = 'cancelled'
+
+    # Check if the user is the ride giver
+    if ride.driver_id == user_id:
+        if ride.status != 'pending':
+            return jsonify({'error': 'Only pending rides can be cancelled'}), 400
+
+        ride.status = 'cancelled'
+        db.session.commit()
+
+        # Notify passengers about the cancellation
+        passengers = BookedRide.query.filter_by(ride_id=ride_id).all()
+        for booking in passengers:
+            notification = Notification(
+                user_id=booking.passenger_id,
+                type='ride',
+                title='Ride Cancelled',
+                message=f'The ride you booked has been cancelled by the driver.',
+                reference_id=ride.id
+            )
+            db.session.add(notification)
+
+        db.session.commit()
+
+        return jsonify({'message': 'Ride cancelled successfully'})
+
+    # Check if the user is a passenger
+    booking = BookedRide.query.filter_by(ride_id=ride_id, passenger_id=user_id).first()
+
+    if not booking:
+        return jsonify({'error': 'You are not part of this ride'}), 403
+
+    if booking.booking_status != 'confirmed':
+        return jsonify({'error': 'Only confirmed bookings can be cancelled'}), 400
+
+    booking.booking_status = 'cancelled'
+    ride.available_seats += booking.seats_booked  # Add seats back to the ride
     db.session.commit()
-    
-    # TODO: Notify passengers about cancellation
-    
-    return jsonify({'message': 'Ride cancelled successfully'})
+
+    # Notify the ride giver about the cancellation
+    notification = Notification(
+        user_id=ride.driver_id,
+        type='ride',
+        title='Booking Cancelled',
+        message=f'A passenger has cancelled their booking.',
+        reference_id=ride.id
+    )
+
+    db.session.add(notification)
+    db.session.commit()
+
+    return jsonify({'message': 'Booking cancelled successfully'})
 
 # Booking Routes
 @app.route('/api/bookings', methods=['POST'])
@@ -921,7 +1056,6 @@ def create_booking():
     return jsonify({
         'message': 'Booking created successfully',
         'booking': {
-            'id': booking.id,
             'ride_id': booking.ride_id,
             'seats': booking.seats,
             'total_price': float(booking.total_price),
